@@ -1,3 +1,4 @@
+import uuid
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -19,7 +20,7 @@ def create_order():
         return jsonify({"error": "customer and amount are required"}), 400
 
     order = {
-        "id": len(orders) + 1,
+        "id": str(uuid.uuid4()),
         "customer": data["customer"],
         "amount": data["amount"],
         "status": "NEW"
