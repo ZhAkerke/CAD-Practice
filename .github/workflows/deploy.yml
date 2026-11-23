@@ -1,0 +1,107 @@
+
+name: Deploy SIS3 to AWS
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      STACK_NAME: orders-sis3-dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Python syntax
+        run: python -m compileall -q app.py worker
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Get ECR repository URI
+        id: ecr
+        run: |
+          REPO_URI=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Outputs[?OutputKey=='ECRRepositoryUri'].OutputValue" \
+            --output text)
+
+          if [[ -z "$REPO_URI" || "$REPO_URI" == "None" ]]; then
+            echo "ECR repository URI not found"
+            exit 1
+          fi
+
+          echo "repo_uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Login to Amazon ECR
+        env:
+          REPO_URI: ${{ steps.ecr.outputs.repo_uri }}
+        run: |
+          REGISTRY="${REPO_URI%%/*}"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+
+      - name: Build and push Docker image
+        env:
+          REPO_URI: ${{ steps.ecr.outputs.repo_uri }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          REPO_NAME="${REPO_URI#*/}"
+
+          if aws ecr describe-images \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+            echo "Image already exists; skipping push."
+          else
+            docker buildx build \
+              --platform linux/amd64 \
+              --tag "$REPO_URI:$IMAGE_TAG" \
+              --push .
+          fi
+
+      - name: Update CloudFormation stack
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set +e
+          OUTPUT=$(aws cloudformation update-stack \
+            --stack-name "$STACK_NAME" \
+            --template-body file://infrastructure/queues.yaml \
+            --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM \
+            --parameters \
+              ParameterKey=Env,UsePreviousValue=true \
+              ParameterKey=DesiredCount,UsePreviousValue=true \
+              ParameterKey=ImageTag,ParameterValue="$IMAGE_TAG" \
+            2>&1)
+          STATUS=$?
+          set -e
+
+          echo "$OUTPUT"
+
+          if [ "$STATUS" -ne 0 ]; then
+            if [[ "$OUTPUT" == *"No updates are to be performed"* ]]; then
+              echo "Stack already has this image."
+              exit 0
+            fi
+            exit "$STATUS"
+          fi
+
+          aws cloudformation wait stack-update-complete \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION"
