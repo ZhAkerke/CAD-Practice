@@ -15,6 +15,13 @@ sqs = boto3.client(
     region_name=os.getenv("AWS_REGION", "us-east-1")
 )
 
+sns = boto3.client(
+    "sns",
+    region_name=os.getenv("AWS_REGION", "us-east-1")
+)
+
+TOPIC_ARN = os.getenv("ORDERS_EVENTS_TOPIC_ARN")
+
 QUEUE_URL = os.getenv("ORDERS_QUEUE_URL")
 
 
@@ -52,6 +59,15 @@ def create_order():
             QueueUrl=QUEUE_URL,
             MessageBody=json.dumps(order)
         )
+        if TOPIC_ARN:
+            sns.publish(
+                TopicArn=TOPIC_ARN,
+                Subject="OrderSubmitted",
+                Message=json.dumps({
+                    "eventType": "OrderSubmitted",
+                    "order": order
+                })
+            )
     except ClientError:
         app.logger.exception("Failed to send order to SQS")
         return jsonify({"error": "Could not submit order"}), 503

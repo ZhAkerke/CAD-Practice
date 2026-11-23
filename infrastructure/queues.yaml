@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Orders queue, dead-letter queue and idempotency table
+Description: Orders queues, DynamoDB table and IAM roles
 
 Parameters:
   Env:
@@ -8,6 +8,18 @@ Parameters:
       - dev
       - prod
     Default: dev
+
+  ImageTag:
+    Type: String
+    Default: v1
+    Description: Immutable ECR image tag
+    
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 2
+    Description: Number of ECS tasks to run
 
 Conditions:
   IsProd: !Equals [!Ref Env, prod]
@@ -36,11 +48,369 @@ Resources:
       KeySchema:
         - AttributeName: orderId
           KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: expiresAt
-        Enabled: true
 
+  
+  OrdersApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendOrdersToSQSAndSNS
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref OrdersEventsTopic
+
+  OrdersWorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessOrders
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt OrdersQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt OrdersTable.Arn
+  
+  OrdersEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-order-events"
+
+  OrdersRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the latest 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  OrdersTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  OrdersApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/api"
+      RetentionInDays: 14
+
+  OrdersWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/worker"
+      RetentionInDays: 14
+
+  OrdersDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages are waiting in the orders dead-letter queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrdersDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      
+  OrdersVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  OrdersInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  OrdersVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref OrdersVPC
+      InternetGatewayId: !Ref OrdersInternetGateway
+
+  OrdersPublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OrdersVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  OrdersPublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref OrdersVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+
+  OrdersPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref OrdersVPC
+
+  OrdersPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: OrdersVPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref OrdersPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref OrdersInternetGateway
+
+  OrdersSubnetARouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OrdersPublicSubnetA
+      RouteTableId: !Ref OrdersPublicRouteTable
+
+  OrdersSubnetBRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref OrdersPublicSubnetB
+      RouteTableId: !Ref OrdersPublicRouteTable
+
+  OrdersALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow public HTTP traffic to the load balancer
+      VpcId: !Ref OrdersVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  OrdersTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow application traffic only from the load balancer
+      VpcId: !Ref OrdersVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref OrdersALBSecurityGroup
+
+  OrdersLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref OrdersPublicSubnetA
+        - !Ref OrdersPublicSubnetB
+      SecurityGroups:
+        - !Ref OrdersALBSecurityGroup
+
+  OrdersTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref OrdersVPC
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: "200"
+
+  OrdersHTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref OrdersLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+  OrdersECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+          
+  OrdersApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-api"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt OrdersTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt OrdersApiTaskRole.Arn
+      ContainerDefinitions:
+        - Name: orders-api
+          Image: !Sub "${OrdersRepository.RepositoryUri}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: ORDERS_QUEUE_URL
+              Value: !Ref OrdersQueue
+            - Name: ORDERS_TABLE
+              Value: !Ref OrdersTable
+            - Name: ORDERS_EVENTS_TOPIC_ARN
+              Value: !Ref OrdersEventsTopic
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersApiLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  OrdersWorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-worker"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt OrdersTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt OrdersWorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: orders-worker
+          Image: !Sub "${OrdersRepository.RepositoryUri}:${ImageTag}"
+          Essential: true
+          Command:
+            - python
+            - worker/consumer.py
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: ORDERS_QUEUE_URL
+              Value: !Ref OrdersQueue
+            - Name: ORDERS_TABLE
+              Value: !Ref OrdersTable
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref OrdersWorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  OrdersApiService:
+    Type: AWS::ECS::Service
+    DependsOn: OrdersHTTPListener
+    Properties:
+      Cluster: !Ref OrdersECSCluster
+      ServiceName: !Sub "${AWS::StackName}-api"
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref OrdersApiTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref OrdersPublicSubnetA
+            - !Ref OrdersPublicSubnetB
+          SecurityGroups:
+            - !Ref OrdersTaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: orders-api
+          ContainerPort: 8080
+          TargetGroupArn: !Ref OrdersTargetGroup
+
+  OrdersWorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref OrdersECSCluster
+      ServiceName: !Sub "${AWS::StackName}-worker"
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref OrdersWorkerTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref OrdersPublicSubnetA
+            - !Ref OrdersPublicSubnetB
+          SecurityGroups:
+            - !Ref OrdersTaskSecurityGroup
 Outputs:
+  LoadBalancerDNS:
+    Value: !GetAtt OrdersLoadBalancer.DNSName
+  VPCId:
+    Value: !Ref OrdersVPC
+  TaskSecurityGroupId:
+    Value: !Ref OrdersTaskSecurityGroup
+  PublicSubnetA:
+    Value: !Ref OrdersPublicSubnetA
+  PublicSubnetB:
+    Value: !Ref OrdersPublicSubnetB
+  TargetGroupArn:
+    Value: !Ref OrdersTargetGroup
+  EventsTopicArn:
+    Value: !Ref OrdersEventsTopic
+  ECRRepositoryUri:
+    Value: !GetAtt OrdersRepository.RepositoryUri
+  TaskExecutionRoleArn:
+    Value: !GetAtt OrdersTaskExecutionRole.Arn
   QueueUrl:
     Value: !Ref OrdersQueue
   QueueArn:
@@ -53,3 +423,7 @@ Outputs:
     Value: !Ref OrdersTable
   OrdersTableArn:
     Value: !GetAtt OrdersTable.Arn
+  OrdersApiTaskRoleArn:
+    Value: !GetAtt OrdersApiTaskRole.Arn
+  OrdersWorkerTaskRoleArn:
+    Value: !GetAtt OrdersWorkerTaskRole.Arn
