@@ -1,0 +1,37 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Orders queue with a dead-letter queue
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+
+Resources:
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !If [IsProd, 120, 30]
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+Outputs:
+  QueueUrl:
+    Value: !Ref OrdersQueue
+  QueueArn:
+    Value: !GetAtt OrdersQueue.Arn
+  DLQUrl:
+    Value: !Ref OrdersDLQ
+  DLQArn:
+    Value: !GetAtt OrdersDLQ.Arn
