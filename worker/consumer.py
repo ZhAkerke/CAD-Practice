@@ -1,12 +1,13 @@
 import json
 import os
-import time
 
 import boto3
 from botocore.exceptions import ClientError
 
-sqs = boto3.client("sqs")
-dynamodb = boto3.resource("dynamodb")
+REGION = os.getenv("AWS_REGION", "us-east-1")
+
+sqs = boto3.client("sqs", region_name=REGION)
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
 
 QUEUE_URL = os.environ["ORDERS_QUEUE_URL"]
 TABLE_NAME = os.environ["ORDERS_TABLE"]
@@ -52,9 +53,6 @@ def main():
             except Exception as error:
                 print(f"Processing failed: {error}")
 
-        time.sleep(1)
-
 
 if __name__ == "__main__":
     main()
-

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Orders queue with a dead-letter queue
+Description: Orders queue, dead-letter queue and idempotency table
 
 Parameters:
   Env:
@@ -26,6 +26,20 @@ Resources:
         deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
         maxReceiveCount: 5
 
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
 Outputs:
   QueueUrl:
     Value: !Ref OrdersQueue
@@ -35,3 +49,7 @@ Outputs:
     Value: !Ref OrdersDLQ
   DLQArn:
     Value: !GetAtt OrdersDLQ.Arn
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  OrdersTableArn:
+    Value: !GetAtt OrdersTable.Arn
